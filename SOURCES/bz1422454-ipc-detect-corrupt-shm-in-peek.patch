@@ -1,0 +1,31 @@
+diff --git a/lib/ringbuffer.c b/lib/ringbuffer.c
+index 60b0ea1..3f401f0 100644
+--- a/lib/ringbuffer.c
++++ b/lib/ringbuffer.c
+@@ -619,7 +619,11 @@ qb_rb_chunk_peek(struct qb_ringbuffer_s * rb, void **data_out, int32_t timeout)
+ 		if (rb->notifier.post_fn) {
+ 			(void)rb->notifier.post_fn(rb->notifier.instance, res);
+ 		}
+-		return 0;
++#ifdef EBADMSG
++		return -EBADMSG;
++#else
++		return -EINVAL;
++#endif
+ 	}
+ 	chunk_size = QB_RB_CHUNK_SIZE_GET(rb, read_pt);
+ 	*data_out = QB_RB_CHUNK_DATA_GET(rb, read_pt);
+diff --git a/tests/check_rb.c b/tests/check_rb.c
+index c54fdc2..cdd85ec 100644
+--- a/tests/check_rb.c
++++ b/tests/check_rb.c
+@@ -179,7 +179,8 @@ START_TEST(test_ring_buffer4)
+ 	}
+ 	for (i = 0; i < 2000; i++) {
+ 		l = qb_rb_chunk_peek(t, (void **)&new_data, 0);
+-		if (l == 0) {
++		if (l < 0) {
++			/* no more to read */
+ 			break;
+ 		}
+ 		ck_assert_int_eq(l, strlen(data));

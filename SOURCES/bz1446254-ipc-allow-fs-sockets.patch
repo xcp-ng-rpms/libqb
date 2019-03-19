@@ -1,0 +1,393 @@
+diff -upr libqb-1.0.1.orig/configure.ac libqb-1.0.1/configure.ac
+--- libqb-1.0.1.orig/configure.ac	2016-11-08 11:15:16.000000000 +0000
++++ libqb-1.0.1/configure.ac	2017-05-15 10:47:39.042145452 +0100
+@@ -482,6 +482,11 @@ AC_ARG_WITH([socket-dir],
+ 	[ SOCKETDIR="$withval" ],
+ 	[ SOCKETDIR="$localstatedir/run" ])
+ 
++AC_ARG_WITH([force-sockets-config-file],
++  [AS_HELP_STRING([--with-force-sockets-config-file=FILE],[config file to force IPC to use filesystem sockets (Linux & Cygwin only) @<:@SYSCONFDIR/libqb/force-filesystem-sockets@:>@])],
++	[ FORCESOCKETSFILE="$withval" ],
++	[ FORCESOCKETSFILE="$sysconfdir/libqb/force-filesystem-sockets" ])
++
+ AC_SUBST(CP)
+ # *FLAGS handling goes here
+ 
+@@ -643,11 +648,14 @@ AM_CONDITIONAL([HAVE_DICT_WORDS], [test
+ # substitute what we need:
+ AC_SUBST([SOCKETDIR])
+ AC_SUBST([LINT_FLAGS])
++AC_SUBST([FORCESOCKETSFILE])
+ 
+ AC_DEFINE_UNQUOTED([SOCKETDIR], "$(eval echo ${SOCKETDIR})", [Socket directory])
+ AC_DEFINE_UNQUOTED([LOCALSTATEDIR], "$(eval echo ${localstatedir})", [localstate directory])
+ AC_DEFINE_UNQUOTED([PACKAGE_FEATURES], "${PACKAGE_FEATURES}", [quarterback built-in features])
+ 
++AC_DEFINE_UNQUOTED([FORCESOCKETSFILE], "$(eval echo ${FORCESOCKETSFILE})", [for sockets config file])
++
+ # version parsing (for qbconfig.h)
+ AC_DEFINE_UNQUOTED([QB_VER_MAJOR],
+                    [$(echo "${VERSION}" \
+Only in libqb-1.0.1: configure.ac.orig
+diff -upr libqb-1.0.1.orig/docs/mainpage.h libqb-1.0.1/docs/mainpage.h
+--- libqb-1.0.1.orig/docs/mainpage.h	2016-11-08 10:10:23.000000000 +0000
++++ libqb-1.0.1/docs/mainpage.h	2017-05-15 10:47:39.042145452 +0100
+@@ -101,6 +101,19 @@
+  * a single one pushed throughout its lifecycle just with a single thread;
+  * anything else would likely warrant external synchronization enforcement.
+  *
++ * @par IPC sockets (Linux only)
++ * On Linux IPC, abstract (non-filesystem) sockets are used by default. If you
++ * need to override this (say in a net=host container) and use sockets that reside
++ * in the filesystem, then create a file called /etc/libqb/force-filesystem-sockets
++ * - this is the default name and can be changed at ./configure time.
++ * The file need contain no text, it's not a configuration file as such, just its
++ * presence will activate the feature.
++ *
++ * Note that this is a global option and read each time a new IPC connection
++ * (client or server) is created. So, to avoid having clients that cannot
++ * connect to running servers it is STRONGLY recommended to only create or remove
++ * this file prior to a system reboot or container restart.
++ *
+  * @par Client API
+  * @copydoc qbipcc.h
+  * @see qbipcc.h
+Only in libqb-1.0.1/docs: mainpage.h.orig
+diff -upr libqb-1.0.1.orig/lib/ipc_int.h libqb-1.0.1/lib/ipc_int.h
+--- libqb-1.0.1.orig/lib/ipc_int.h	2016-02-22 16:01:51.000000000 +0000
++++ libqb-1.0.1/lib/ipc_int.h	2017-05-15 10:47:39.042145452 +0100
+@@ -205,4 +205,6 @@ int32_t qb_ipcs_process_request(struct q
+ 
+ int32_t qb_ipc_us_sock_error_is_disconnected(int err);
+ 
++int use_filesystem_sockets(void);
++
+ #endif /* QB_IPC_INT_H_DEFINED */
+diff -upr libqb-1.0.1.orig/lib/ipc_setup.c libqb-1.0.1/lib/ipc_setup.c
+--- libqb-1.0.1.orig/lib/ipc_setup.c	2016-11-08 10:10:23.000000000 +0000
++++ libqb-1.0.1/lib/ipc_setup.c	2017-05-15 10:47:39.042145452 +0100
+@@ -69,7 +69,6 @@ struct ipc_auth_data {
+ 
+ };
+ 
+-
+ static int32_t qb_ipcs_us_connection_acceptor(int fd, int revent, void *data);
+ 
+ ssize_t
+@@ -286,12 +285,13 @@ qb_ipcc_stream_sock_connect(const char *
+ 	address.sun_len = QB_SUN_LEN(&address);
+ #endif
+ 
+-#if defined(QB_LINUX) || defined(QB_CYGWIN)
+-	snprintf(address.sun_path + 1, UNIX_PATH_MAX - 1, "%s", socket_name);
+-#else
+-	snprintf(address.sun_path, sizeof(address.sun_path), "%s/%s", SOCKETDIR,
+-		 socket_name);
+-#endif
++	if (!use_filesystem_sockets()) {
++		snprintf(address.sun_path + 1, UNIX_PATH_MAX - 1, "%s", socket_name);
++	} else {
++		snprintf(address.sun_path, sizeof(address.sun_path), "%s/%s", SOCKETDIR,
++			 socket_name);
++	}
++
+ 	if (connect(request_fd, (struct sockaddr *)&address,
+ 		    QB_SUN_LEN(&address)) == -1) {
+ 		res = -errno;
+@@ -535,10 +535,11 @@ qb_ipcs_us_publish(struct qb_ipcs_servic
+ #endif
+ 
+ 	qb_util_log(LOG_INFO, "server name: %s", s->name);
+-#if defined(QB_LINUX) || defined(QB_CYGWIN)
+-	snprintf(un_addr.sun_path + 1, UNIX_PATH_MAX - 1, "%s", s->name);
+-#else
+-	{
++
++	if (!use_filesystem_sockets()) {
++		snprintf(un_addr.sun_path + 1, UNIX_PATH_MAX - 1, "%s", s->name);
++	}
++	else {
+ 		struct stat stat_out;
+ 		res = stat(SOCKETDIR, &stat_out);
+ 		if (res == -1 || (res == 0 && !S_ISDIR(stat_out.st_mode))) {
+@@ -552,7 +553,6 @@ qb_ipcs_us_publish(struct qb_ipcs_servic
+ 			 s->name);
+ 		unlink(un_addr.sun_path);
+ 	}
+-#endif
+ 
+ 	res = bind(s->server_sock, (struct sockaddr *)&un_addr,
+ 		   QB_SUN_LEN(&un_addr));
+@@ -561,15 +561,15 @@ qb_ipcs_us_publish(struct qb_ipcs_servic
+ 		qb_util_perror(LOG_ERR, "Could not bind AF_UNIX (%s)",
+ 			       un_addr.sun_path);
+ 		goto error_close;
+-	}
++        }
+ 
+ 	/*
+ 	 * Allow everyone to write to the socket since the IPC layer handles
+ 	 * security automatically
+ 	 */
+-#if !defined(QB_LINUX) && !defined(QB_CYGWIN)
+-	res = chmod(un_addr.sun_path, S_IRWXU | S_IRWXG | S_IRWXO);
+-#endif
++	if (use_filesystem_sockets()) {
++	        res = chmod(un_addr.sun_path, S_IRWXU | S_IRWXG | S_IRWXO);
++        }
+ #ifdef SO_PASSCRED
+ 	setsockopt(s->server_sock, SOL_SOCKET, SO_PASSCRED, &on, sizeof(on));
+ #endif
+@@ -593,6 +593,16 @@ qb_ipcs_us_withdraw(struct qb_ipcs_servi
+ 	qb_util_log(LOG_INFO, "withdrawing server sockets");
+ 	(void)s->poll_fns.dispatch_del(s->server_sock);
+ 	shutdown(s->server_sock, SHUT_RDWR);
++
++	if (use_filesystem_sockets()) {
++		struct sockaddr_un sockname;
++		socklen_t socklen = sizeof(sockname);
++		if ((getsockname(s->server_sock, (struct sockaddr *)&sockname, &socklen) == 0) &&
++		    sockname.sun_family == AF_UNIX) {
++			unlink(sockname.sun_path);
++		}
++	}
++
+ 	close(s->server_sock);
+ 	s->server_sock = -1;
+ 	return 0;
+diff -upr libqb-1.0.1.orig/lib/ipc_socket.c libqb-1.0.1/lib/ipc_socket.c
+--- libqb-1.0.1.orig/lib/ipc_socket.c	2016-11-08 10:10:23.000000000 +0000
++++ libqb-1.0.1/lib/ipc_socket.c	2017-05-15 10:47:39.043145455 +0100
+@@ -42,6 +42,26 @@ struct ipc_us_control {
+ };
+ #define SHM_CONTROL_SIZE (3 * sizeof(struct ipc_us_control))
+ 
++int use_filesystem_sockets(void)
++{
++	static int need_init = 1;
++	static int filesystem_sockets = 0;
++
++	if (need_init) {
++		struct stat buf;
++
++		need_init = 0;
++#if defined(QB_LINUX) || defined(QB_CYGWIN)
++		if (stat(FORCESOCKETSFILE, &buf) == 0) {
++			filesystem_sockets = 1;
++		}
++#else
++		filesystem_sockets = 1;
++#endif
++	}
++	return filesystem_sockets;
++}
++
+ static void
+ set_sock_addr(struct sockaddr_un *address, const char *socket_name)
+ {
+@@ -51,12 +71,12 @@ set_sock_addr(struct sockaddr_un *addres
+ 	address->sun_len = QB_SUN_LEN(address);
+ #endif
+ 
+-#if defined(QB_LINUX) || defined(QB_CYGWIN)
+-	snprintf(address->sun_path + 1, UNIX_PATH_MAX - 1, "%s", socket_name);
+-#else
+-	snprintf(address->sun_path, sizeof(address->sun_path), "%s/%s", SOCKETDIR,
+-		 socket_name);
+-#endif
++	if (!use_filesystem_sockets()) {
++		snprintf(address->sun_path + 1, UNIX_PATH_MAX - 1, "%s", socket_name);
++	} else {
++		snprintf(address->sun_path, sizeof(address->sun_path), "%s/%s", SOCKETDIR,
++			 socket_name);
++	}
+ }
+ 
+ static int32_t
+@@ -81,15 +101,16 @@ qb_ipc_dgram_sock_setup(const char *base
+ 	}
+ 	snprintf(sock_path, PATH_MAX, "%s-%s", base_name, service_name);
+ 	set_sock_addr(&local_address, sock_path);
+-#if !(defined(QB_LINUX) || defined(QB_CYGWIN))
+-	res = unlink(local_address.sun_path);
+-#endif
++	if (use_filesystem_sockets()) {
++		res = unlink(local_address.sun_path);
++	}
+ 	res = bind(request_fd, (struct sockaddr *)&local_address,
+ 		   sizeof(local_address));
+-#if !(defined(QB_LINUX) || defined(QB_CYGWIN))
+-	chmod(local_address.sun_path, 0660);
+-	chown(local_address.sun_path, -1, gid);
+-#endif
++
++	if (use_filesystem_sockets()) {
++		chmod(local_address.sun_path, 0660);
++		chown(local_address.sun_path, -1, gid);
++	}
+ 	if (res < 0) {
+ 		goto error_connect;
+ 	}
+@@ -316,36 +337,33 @@ _finish_connecting(struct qb_ipc_one_way
+ static void
+ qb_ipcc_us_disconnect(struct qb_ipcc_connection *c)
+ {
+-#if !(defined(QB_LINUX) || defined(QB_CYGWIN))
+-  struct sockaddr_un un_addr;
+-  socklen_t un_addr_len = sizeof(struct sockaddr_un);
+-  char *base_name;
+-  char sock_name[PATH_MAX];
+-  size_t length;
+-#endif
+-
+ 	munmap(c->request.u.us.shared_data, SHM_CONTROL_SIZE);
+ 	unlink(c->request.u.us.shared_file_name);
+ 
+-#if !(defined(QB_LINUX) || defined(QB_CYGWIN))
+-    if (getsockname(c->response.u.us.sock, (struct sockaddr *)&un_addr, &un_addr_len) == 0) {
+-      length = strlen(un_addr.sun_path);
+-      base_name = strndup(un_addr.sun_path,length-9);
+-      qb_util_log(LOG_DEBUG, "unlinking socket bound files with base_name=%s length=%d",base_name,length);
+-      snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"request");
+-      qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
+-      unlink(sock_name);
+-      snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"event");
+-      qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
+-      unlink(sock_name);
+-      snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"event-tx");
+-      qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
+-      unlink(sock_name);
+-      snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"response");
+-      qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
+-      unlink(sock_name);
+-    }
+-#endif
++	if (use_filesystem_sockets()) {
++		struct sockaddr_un un_addr;
++		socklen_t un_addr_len = sizeof(struct sockaddr_un);
++		char *base_name;
++		char sock_name[PATH_MAX];
++		size_t length;
++		if (getsockname(c->response.u.us.sock, (struct sockaddr *)&un_addr, &un_addr_len) == 0) {
++			length = strlen(un_addr.sun_path);
++			base_name = strndup(un_addr.sun_path,length-9);
++			qb_util_log(LOG_DEBUG, "unlinking socket bound files with base_name=%s length=%d",base_name,length);
++			snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"request");
++			qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
++			unlink(sock_name);
++			snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"event");
++			qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
++			unlink(sock_name);
++			snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"event-tx");
++			qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
++			unlink(sock_name);
++			snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"response");
++			qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
++			unlink(sock_name);
++		}
++	}
+ 	qb_ipcc_us_sock_close(c->event.u.us.sock);
+ 	qb_ipcc_us_sock_close(c->request.u.us.sock);
+ 	qb_ipcc_us_sock_close(c->setup.u.us.sock);
+@@ -451,11 +469,11 @@ retry_peek:
+ 
+ 		if (errno != EAGAIN) {
+ 			final_rc = -errno;
+-#if !(defined(QB_LINUX) || defined(QB_CYGWIN))
+-			if (errno == ECONNRESET || errno == EPIPE) {
+-				final_rc = -ENOTCONN;
++			if (use_filesystem_sockets()) {
++				if (errno == ECONNRESET || errno == EPIPE) {
++					final_rc = -ENOTCONN;
++				}
+ 			}
+-#endif
+ 			goto cleanup_sigpipe;
+ 		}
+ 
+@@ -686,38 +704,36 @@ _sock_rm_from_mainloop(struct qb_ipcs_co
+ static void
+ qb_ipcs_us_disconnect(struct qb_ipcs_connection *c)
+ {
+-#if !(defined(QB_LINUX) || defined(QB_CYGWIN))
+-	struct sockaddr_un un_addr;
+-	socklen_t un_addr_len = sizeof(struct sockaddr_un);
+-	char *base_name;
+-	char sock_name[PATH_MAX];
+-	size_t length;
+-#endif
+ 	qb_enter();
+ 
+ 	if (c->state == QB_IPCS_CONNECTION_ESTABLISHED ||
+ 	    c->state == QB_IPCS_CONNECTION_ACTIVE) {
+ 		_sock_rm_from_mainloop(c);
+ 
+-#if !(defined(QB_LINUX) || defined(QB_CYGWIN))
+-		if (getsockname(c->response.u.us.sock, (struct sockaddr *)&un_addr, &un_addr_len) == 0) {
+-			length = strlen(un_addr.sun_path);
+-			base_name = strndup(un_addr.sun_path,length-8);
+-			qb_util_log(LOG_DEBUG, "unlinking socket bound files with base_name=%s length=%d",base_name,length);
+-			snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"request");
+-			qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
+-			unlink(sock_name);
+-			snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"event");
+-			qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
+-			unlink(sock_name);
+-			snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"event-tx");
+-			qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
+-			unlink(sock_name);
+-			snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"response");
+-			qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
+-			unlink(sock_name);
++		if (use_filesystem_sockets()) {
++			struct sockaddr_un un_addr;
++			socklen_t un_addr_len = sizeof(struct sockaddr_un);
++			char *base_name;
++			char sock_name[PATH_MAX];
++			size_t length;
++			if (getsockname(c->response.u.us.sock, (struct sockaddr *)&un_addr, &un_addr_len) == 0) {
++				length = strlen(un_addr.sun_path);
++				base_name = strndup(un_addr.sun_path,length-8);
++				qb_util_log(LOG_DEBUG, "unlinking socket bound files with base_name=%s length=%d",base_name,length);
++				snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"request");
++				qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
++				unlink(sock_name);
++				snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"event");
++				qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
++				unlink(sock_name);
++				snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"event-tx");
++				qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
++				unlink(sock_name);
++				snprintf(sock_name,PATH_MAX,"%s-%s",base_name,"response");
++				qb_util_log(LOG_DEBUG, "unlink sock_name=%s",sock_name);
++				unlink(sock_name);
++			}
+ 		}
+-#endif
+ 		qb_ipcc_us_sock_close(c->setup.u.us.sock);
+ 		qb_ipcc_us_sock_close(c->request.u.us.sock);
+ 		qb_ipcc_us_sock_close(c->event.u.us.sock);
+Only in libqb-1.0.1/lib: ipc_socket.c.orig
+diff -upr libqb-1.0.1.orig/tests/check_ipc.c libqb-1.0.1/tests/check_ipc.c
+--- libqb-1.0.1.orig/tests/check_ipc.c	2016-11-08 11:15:16.000000000 +0000
++++ libqb-1.0.1/tests/check_ipc.c	2017-05-15 10:47:39.043145455 +0100
+@@ -1417,10 +1417,17 @@ END_TEST
+ #ifdef HAVE_FAILURE_INJECTION
+ START_TEST(test_ipcc_truncate_when_unlink_fails_shm)
+ {
++	char sock_file[PATH_MAX];
+ 	qb_enter();
+-	_fi_unlink_inject_failure = QB_TRUE;
+ 	ipc_type = QB_IPC_SHM;
+ 	set_ipc_name(__func__);
++
++	sprintf(sock_file, "%s/%s", SOCKETDIR, ipc_name);
++	/* If there's an old socket left from a previous run this test will fail
++	   unexpectedly, so try to remove it first */
++	unlink(sock_file);
++
++	_fi_unlink_inject_failure = QB_TRUE;
+ 	test_ipc_server_fail();
+ 	_fi_unlink_inject_failure = QB_FALSE;
+ 	qb_leave();
+Only in libqb-1.0.1/tests: check_ipc.c.orig
